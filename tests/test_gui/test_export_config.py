@@ -1,0 +1,84 @@
+"""Tests for export dialog pure-data configuration types."""
+
+from pathlib import Path
+
+from al_dic.gui.dialogs.export_dialog import (
+    VizExportHint,
+    FieldImageConfig,
+    ExportConfig,
+)
+
+
+class TestVizExportHint:
+    def test_defaults(self):
+        h = VizExportHint()
+        assert h.colormap == "jet"
+        assert h.auto_range is True
+        assert h.vmin == 0.0
+        assert h.vmax == 1.0
+        assert h.show_deformed is False
+        assert h.overlay_alpha == 0.7
+
+
+class TestFieldImageConfig:
+    def test_creation(self):
+        cfg = FieldImageConfig(
+            field_name="disp_u",
+            enabled=True,
+            colormap="RdBu_r",
+            auto_range=False,
+            vmin=-0.1,
+            vmax=0.1,
+        )
+        assert cfg.field_name == "disp_u"
+        assert cfg.bg_alpha == 0.7  # default
+
+
+class TestExportConfig:
+    def test_defaults(self):
+        cfg = ExportConfig(
+            dest_dir=Path("/tmp/export"),
+            prefix="test",
+            timestamp="20260411_120000",
+        )
+        assert cfg.export_npz is True
+        assert cfg.export_mat is True
+        assert cfg.export_csv is True
+        assert cfg.data_fields == []
+        assert cfg.export_images is False
+        # Default format is JPEG: on a speckle background it is ~4x smaller and
+        # ~7x faster to encode than PNG (near-lossless for field visualisation).
+        assert cfg.image_format == "jpeg"
+        assert cfg.jpeg_quality == 92
+        # Output capped to 1024 px (long edge) by default; near-lossless since
+        # field detail is mesh-bounded, and much smaller/faster than native.
+        assert cfg.image_output_max_dim == 1024
+        assert cfg.anim_output_max_dim == 1024
+        assert cfg.anim_frame_step == 1
+        # Colorbar + margin defaults reproduce the historical look (no margin)
+        assert cfg.colorbar_style.position == "right"
+        assert cfg.colorbar_style.font_family == "sans-serif"
+        assert cfg.export_margin_ratio == 0.0
+        assert cfg.export_margin_color == "white"
+        assert cfg.anim_format == "mp4"
+        assert cfg.export_report is False
+        # Colorbar default must stay ON — otherwise exported images
+        # show field colours but no scale, which is useless for
+        # quantitative interpretation.
+        assert cfg.img_include_colorbar is True
+        assert cfg.anim_include_colorbar is True
+
+    def test_custom_values(self):
+        cfg = ExportConfig(
+            dest_dir=Path("/tmp/custom"),
+            prefix="exp",
+            timestamp="20260411",
+            export_npz=False,
+            image_dpi=300,
+            anim_fps=30,
+            bg_mode="current_frame",
+        )
+        assert cfg.export_npz is False
+        assert cfg.image_dpi == 300
+        assert cfg.anim_fps == 30
+        assert cfg.bg_mode == "current_frame"

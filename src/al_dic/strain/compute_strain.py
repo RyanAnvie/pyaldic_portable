@@ -1,0 +1,276 @@
+"""Strain computation router: FEM strain + smoothing + type conversion.
+
+Port of MATLAB strain/compute_strain.m (Jin Yang, Caltech).
+
+Orchestrates the strain computation pipeline:
+    1. Compute raw deformation gradient via FEM (global_nodal_strain_fem)
+       or plane fitting (comp_def_grad).
+    2. Smooth the deformation gradient field (smooth_field_sparse).
+    3. Convert to the selected strain measure (apply_strain_type).
+    4. Compute derived quantities (principal strains, max shear, von Mises).
+
+MATLAB/Python differences:
+    - MATLAB supports methods 0-3; Python preserves this but recommends
+      method 2 (plane fitting) or 3 (FEM nodal strain).
+    - Python returns a StrainResult dataclass with all derived quantities.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from numpy.typing import NDArray
+
+from ..core.data_structures import DICMesh, DICPara, StrainResult
+from ..utils.region_analysis import NodeRegionMap
+from .apply_strain_type import apply_strain_type
+from .comp_def_grad import (
+    comp_def_grad,
+    edge_valid_mask,
+    node_boundary_distance,
+)
+from .nodal_strain_fem import global_nodal_strain_fem
+from .smooth_field import smooth_field_sparse
+
+
+def _compute_derived_strains(
+    exx: NDArray[np.float64],
+    exy: NDArray[np.float64],
+    eyy: NDArray[np.float64],
+) -> tuple[NDArray, NDArray, NDArray, NDArray]:
+    """Compute principal strains, max shear, and von Mises from 2D tensor.
+
+    Args:
+        exx, exy, eyy: Strain components (n_nodes,).
+
+    Returns:
+        (principal_max, principal_min, maxshear, von_mises) each (n_nodes,).
+    """
+    # Principal strains from eigenvalues of 2D symmetric tensor
+    avg = 0.5 * (exx + eyy)
+    diff = 0.5 * (exx - eyy)
+    R = np.sqrt(diff**2 + exy**2)
+
+    principal_max = avg + R
+    principal_min = avg - R
+    maxshear = R  # max shear = (e1 - e2) / 2 = R
+
+    # Von Mises equivalent strain (plane stress)
+    von_mises = np.sqrt(
+        exx**2 + eyy**2 - exx * eyy + 3.0 * exy**2
+    )
+
+    return principal_max, principal_min, maxshear, von_mises
+
+
+def compute_strain(
+    mesh: DICMesh,
+    para: DICPara,
+    U: NDArray[np.float64],
+    node_region_map: NodeRegionMap,
+    neighbors: tuple | None = None,
+) -> StrainResult:
+    """Compute strain from displacement via FEM + smoothing + type conversion.
+
+    Routes through the strain computation pipeline based on
+    ``para.method_to_compute_strain``:
+        - 0: Use ADMM deformation gradient directly (requires F input).
+        - 2: Local weighted plane fitting (comp_def_grad).
+        - 3: FEM nodal strain via shape function derivatives (recommended).
+
+    After computing raw gradients, applies:
+        1. Sparse Gaussian smoothing within connected regions.
+        2. Strain type conversion (infinitesimal/Eulerian/Green-Lagrangian).
+        3. Derived strain computation (principal, shear, von Mises).
+
+    Args:
+        mesh: DICMesh with coordinates and connectivity.
+        para: DIC parameters.
+        U: Displacement vector (2*n_nodes,), interleaved.
+        node_region_map: Pre-computed node-to-region mapping.
+        neighbors: Optional precomputed plane-fit neighbour cache (see
+            ``comp_def_grad``); only used for ``method == 2`` (plane fitting).
+            Skips the per-frame KDTree build when the mesh coordinates are
+            frame-invariant (total-Lagrangian strain).
+
+    Returns:
+        StrainResult with all strain components populated.
+    """
+    n_nodes = mesh.coordinates_fem.shape[0]
+    method = para.method_to_compute_strain
+
+    # --- Step 1: Compute raw deformation gradient ---
+    # Node-to-interior-barrier distance (plane fitting): computed ONCE and
+    # shared by the near-barrier gate and the edge-trim below, replacing the two
+    # per-frame full-image distance transforms.
+    _node_dist = None
+    if method == 0 or method == 1:
+        # Method 0: use F directly (caller should provide); fallback to FEM
+        # Method 1: legacy central difference; use FEM instead
+        F_raw = global_nodal_strain_fem(mesh, para, U)
+    elif method == 2:
+        # Plane fitting with search radius
+        _mask = para.img_ref_mask
+        if _mask is not None:
+            _node_dist = node_boundary_distance(mesh.coordinates_fem, _mask)
+        _near = (None if _node_dist is None
+                 else _node_dist < para.strain_plane_fit_rad)
+        F_raw = comp_def_grad(
+            U, mesh.coordinates_fem, mesh.elements_fem,
+            rad=para.strain_plane_fit_rad,
+            mask=_mask,
+            neighbors=neighbors,
+            near_barrier=_near,
+        )
+        # Fill any NaN from plane fitting. If **every** node came back
+        # NaN (e.g. the VSG radius is smaller than the DIC node spacing
+        # so no node has enough neighbours for a 3-unknown plane fit),
+        # fail loudly with an actionable message rather than letting
+        # fill_nan_idw silently return zeros — which would masquerade
+        # as a "converged" all-zero strain field.
+        from ..utils.outlier_detection import fill_nan_idw
+        try:
+            F_raw = fill_nan_idw(
+                F_raw, mesh.coordinates_fem, n_components=4,
+                on_all_nan="raise",
+            )
+        except ValueError as exc:
+            subset_step = getattr(para, "winstepsize", None) \
+                or getattr(para, "subset_step", None)
+            rad = para.strain_plane_fit_rad
+            detail = (
+                f"Plane-fit strain failed: every node's plane fit "
+                f"returned NaN (no node had >= 3 valid neighbors "
+                f"within the VSG radius). "
+                f"VSG radius = {rad} px"
+            )
+            if subset_step is not None:
+                detail += f", DIC node spacing = {subset_step} px"
+                detail += (
+                    f". Recommended VSG size >= {2 * subset_step + 1} px "
+                    f"(VSG radius >= {subset_step} px). "
+                )
+            detail += (
+                "Fix: increase VSG Size in the Strain panel, or "
+                "switch Method to 'FEM nodal' which does not depend "
+                "on a neighborhood radius."
+            )
+            raise ValueError(detail) from exc
+    elif method == 3:
+        F_raw = global_nodal_strain_fem(mesh, para, U)
+    else:
+        F_raw = global_nodal_strain_fem(mesh, para, U)
+
+    # --- Step 2: Smooth the strain field ---
+    smoothness = para.strain_smoothness
+    if smoothness > 0:
+        factor = 500.0 * smoothness
+        # Adaptive sigma: per-node based on local element spacing
+        from .smooth_field import compute_node_local_spacing
+        sigma = compute_node_local_spacing(
+            mesh.coordinates_fem, mesh.elements_fem,
+        ) * factor
+        F_smooth = smooth_field_sparse(
+            F_raw, mesh.coordinates_fem, sigma, node_region_map,
+            n_components=4,
+        )
+    else:
+        F_smooth = F_raw
+
+    # --- Step 2b: Rotation via polar decomposition F_cm = R U ---
+    # Exact for large angles; returns degrees (CCW positive in image coordinates).
+    # F_cm = I + grad(u):  [[1+du/dx, du/dy], [dv/dx, 1+dv/dy]]
+    _f11 = 1.0 + F_smooth[0::4]
+    _f12 = F_smooth[2::4]
+    _f21 = F_smooth[1::4]
+    _f22 = 1.0 + F_smooth[3::4]
+    _Fmat = np.stack(
+        [np.stack([_f11, _f12], axis=-1),
+         np.stack([_f21, _f22], axis=-1)],
+        axis=1,
+    )  # (n_nodes, 2, 2)
+    try:
+        _Usvd, _s, _Vt = np.linalg.svd(_Fmat)
+        _R = _Usvd @ _Vt
+        # Ensure proper rotation (det = +1), not reflection
+        _flip = np.linalg.det(_R) < 0
+        if np.any(_flip):
+            _Usvd[_flip, :, -1] *= -1
+            _R = _Usvd @ _Vt
+        rotation = np.degrees(np.arctan2(_R[:, 1, 0], _R[:, 0, 0]))
+    except np.linalg.LinAlgError:
+        # Fallback: infinitesimal approximation in degrees
+        rotation = np.degrees((F_smooth[1::4] - F_smooth[2::4]) / 2.0)
+
+    # --- Step 3: Strain type conversion ---
+    F_strain, F_strain_world = apply_strain_type(F_smooth, para)
+
+    # --- Step 4: Extract components and compute derived quantities ---
+    # World coordinates: F21 and F12 have flipped signs
+    dudx = F_strain_world[0::4]
+    dvdx = F_strain_world[1::4]
+    dudy = F_strain_world[2::4]
+    dvdy = F_strain_world[3::4]
+
+    # Strain tensor (symmetric part of displacement gradient)
+    exx = dudx
+    eyy = dvdy
+    exy = 0.5 * (dudy + dvdx)
+
+    # Displacement in world coordinates
+    disp_u = U[0::2] * para.um2px
+    disp_v = -U[1::2] * para.um2px  # y-flip for world coords
+
+    # Derived strains
+    principal_max, principal_min, maxshear, von_mises = _compute_derived_strains(
+        exx, exy, eyy,
+    )
+
+    # --- Edge-trim validity mask (plane fitting only) ---
+    # Geometric (distance-to-boundary) reliability flag; strain *values* stay
+    # dense, consumers may NaN-out invalid nodes for display/export.
+    strain_valid = None
+    if method == 2:
+        strain_valid = edge_valid_mask(
+            mesh.coordinates_fem,
+            para.img_ref_mask,
+            para.strain_plane_fit_rad,
+            getattr(para, "strain_edge_trim_alpha", 0.0),
+            node_dist=_node_dist,
+        )
+        # Guard: if edge trimming flags EVERY node unreliable, the exported
+        # and displayed strain would be entirely NaN (trimmed_field NaNs out
+        # ~strain_valid) with no other symptom — the compute "succeeds" but
+        # every field is blank. Fail loudly with an actionable message rather
+        # than silently emitting an all-NaN field.
+        if not strain_valid.any():
+            n = int(strain_valid.size)
+            rad = para.strain_plane_fit_rad
+            alpha = getattr(para, "strain_edge_trim_alpha", 0.0)
+            raise ValueError(
+                f"Edge trimming removed all {n} strain nodes: the trim band "
+                f"alpha * VSG radius = {alpha:.2f} * {rad:g} = "
+                f"{alpha * rad:.1f} px exceeds the ROI's half-thickness, so "
+                f"every plane-fit window crosses the ROI/hole/image boundary "
+                f"and the strain field would export as all-NaN. "
+                f"Fix: reduce VSG Size, lower 'Trim low-confidence edges' "
+                f"toward 0, or switch Method to 'FEM nodal' (no VSG / edge "
+                f"trim)."
+            )
+
+    return StrainResult(
+        disp_u=disp_u,
+        disp_v=disp_v,
+        dudx=dudx,
+        dvdx=dvdx,
+        dudy=dudy,
+        dvdy=dvdy,
+        strain_exx=exx,
+        strain_exy=exy,
+        strain_eyy=eyy,
+        strain_principal_max=principal_max,
+        strain_principal_min=principal_min,
+        strain_maxshear=maxshear,
+        strain_von_mises=von_mises,
+        strain_rotation=rotation,
+        strain_valid=strain_valid,
+    )

@@ -1,0 +1,1600 @@
+diff --git a/.github/workflows/portable-import.yml b/.github/workflows/portable-import.yml
+new file mode 100644
+index 0000000..30b18a8
+--- /dev/null
++++ b/.github/workflows/portable-import.yml
+@@ -0,0 +1,23 @@
++name: Portable image import
++
++on: [push, pull_request]
++
++jobs:
++  image-import:
++    strategy:
++      fail-fast: false
++      matrix:
++        os: [ubuntu-latest, macos-latest, windows-latest]
++        python: ['3.10', '3.12']
++    runs-on: ${{ matrix.os }}
++    env:
++      QT_QPA_PLATFORM: offscreen
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with:
++          python-version: ${{ matrix.python }}
++      - if: runner.os == 'Linux'
++        run: sudo apt-get update && sudo apt-get install -y libegl1 libxkbcommon0 libdbus-1-3
++      - run: python -m pip install -e .
++      - run: python -m unittest tests.test_large_sequence_support -v
+diff --git a/PORTABLE_IMPORT.md b/PORTABLE_IMPORT.md
+new file mode 100644
+index 0000000..bf0ae4d
+--- /dev/null
++++ b/PORTABLE_IMPORT.md
+@@ -0,0 +1,119 @@
++# Large image sequence import
++
++This source build fixes the image import bottleneck in the supplied pyALDIC
++1.0.5 source. The changes have no computer name, user path, image count, or
++resolution specific branch. Windows, macOS, and Linux use the same Python,
++NumPy, Pillow, OpenCV, and Qt implementation.
++
++## Use this source build
++
++Use Python 3.10 or later. From this extracted directory, preferably in a
++dedicated virtual environment, run:
++
++```console
++python -m pip install .
++python -m al_dic
++```
++
++This starts the modified Python installation. An existing desktop app bundle
++or installer is a separate installation and does not acquire these changes.
++The original repository directory and installed application were not edited.
++The archive includes the complete code, runtime assets, examples, tests,
++and `large_sequence_changes.patch`. Large demonstration videos and GIFs
++remain available in the upstream repository.
++
++## Changes
++
++1. The image list inserts lightweight tree items in one batch. A Qt delegate
++   paints visible ROI actions and routes clicks to the selected frame. There
++   is no QPushButton allocation for every image. Selection, per frame ROI,
++   context menu actions, and natural sorting remain available.
++2. GUI import discovers files, checks headers, and decodes the first preview
++   on one background worker. Progress and cancellation are visible. Only
++   the newest folder request can update the interface. Repeated requests
++   reuse one worker slot instead of starting an unbounded number of threads.
++3. Cancellation and failures preserve the previous sequence. Closing the
++   main window cancels import and lets the event loop run until the worker
++   exits. Native filesystem reads cannot be forcibly interrupted; a stalled
++   remote read must return before cancellation can finish.
++4. Grayscale, RGB preview, and streaming computation caches have both item
++   and byte limits. With psutil installed, each GUI cache uses at most 2%
++   of currently available RAM, capped at 128 MiB; the streaming cache uses
++   at most 4%, capped at 256 MiB. Without psutil, each cache conservatively
++   uses at most 64 MiB. A frame larger than its budget is returned without
++   retaining it in the cache. Eviction affects speed, not pixel values.
++5. Reference frames that inherit one ROI share one immutable uint8 snapshot.
++   Unmasked frames share one immutable all ones mask. Custom masks keep
++   their original values and are copied once per distinct source array.
++6. Changing sort order does not repeat the header scan. Deleting the whole
++   sequence also clears the controller's source list.
++
++The existing synchronous `load_folder()` API remains available for scripts
++and session helpers. GUI browse and drop use `load_folder_async()`.
++
++## Reference to pyALDIC 3D
++
++The reference project's public README and architecture record describe lazy
++frames and masks, bounded LRU caches, and shared all ones masks:
++
++https://github.com/zachtong/pyALDIC-3D/blob/main/README.md
++
++https://github.com/zachtong/pyALDIC-3D/blob/main/docs/architecture/00_INDEX.md
++
++This implementation adopts those documented policies, with byte limits added
++for varying image resolutions. The relevant implementation source page could
++not be retrieved in this environment, so this is an independent implementation,
++not a claim that its code was copied verbatim. Its stereo solver memory
++projection is not reused as an estimate for this different 2D solver.
++
++## Validation
++
++25 behavioral regression tests passed locally with Python 3.12 and Qt 6.11.1
++on macOS ARM64 in offscreen mode. They cover worker responsiveness, cancellation,
++queued stale results, repeated requests, file drops, Unicode paths, malformed
++images, size mismatch reporting, window close, ROI interactions, bounded cache
++eviction, and shared mask isolation. A synthetic incremental DIC run preserves
++displacement, cumulative displacement, and deformation gradients exactly when
++using the streaming cache and shared masks. Tests also verify exact normalized
++pixels for uint8 and uint16 inputs across cache budgets, including zero.
++
++```console
++python -m unittest tests.test_large_sequence_support -v
++```
++
++The full existing pytest suite was not run because pytest was unavailable in
++the local test environment. The new focused tests use standard library unittest.
++The existing grayscale cache regression has been updated for the new bounded
++cache contract. A separate CI workflow runs the focused tests on Windows,
++macOS, and Linux with Python 3.10 and 3.12. That remote matrix is configured,
++but was not executed here; cross platform execution is not claimed as verified.
++
++Measured local checks:
++
++| Check | Result |
++| --- | --- |
++| Original list, 3000 rows, no image reads | 48.87 seconds |
++| Modified list, 10000 rows including event processing | 0.072 seconds |
++| Actual ROI button widgets in modified list | 0 |
++| Full window import, 10000 paths to 4053 × 4053 uint16 TIFF | 0.749 seconds |
++| GUI timer callbacks during that import | 66 |
++| Largest observed timer gap | 0.093 seconds |
++| Inherited ROI masks, 10000 frames at 4053 × 4053 | 2 buffers, 32853618 bytes |
++
++The full resolution import fixture used 10000 hard links to one uncompressed
++TIFF, avoiding hundreds of gigabytes of duplicated test data. It verifies the
++file count, full resolution decode, signal path, and list behavior, but does
++not measure storage throughput for 10000 different experimental images.
++Times are observations from this test environment, not universal guarantees.
++
++## Scope
++
++This change bounds import and image cache overhead and removes repeated
++inherited ROI allocation. It does not make an arbitrarily large solver run
++fit every computer. The solver still needs its current frames and working
++arrays. Per frame mesh, displacement, and strain results still accumulate
++with the number of nodes and frames. No image downsampling, precision
++reduction, or automatic change of the DIC parameters is introduced.
++
++The newly added import status messages use Qt translation calls and fall back
++to English until the translation catalogs are updated and rebuilt.
+diff --git a/src/al_dic/gui/app.py b/src/al_dic/gui/app.py
+index 090a2dd..54ed091 100644
+--- a/src/al_dic/gui/app.py
++++ b/src/al_dic/gui/app.py
+@@ -7,7 +7,7 @@ import traceback
+ from pathlib import Path
+ 
+ import shiboken6
+-from PySide6.QtCore import QCoreApplication, Qt
++from PySide6.QtCore import QCoreApplication, QTimer, Qt
+ from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+ from PySide6.QtWidgets import (
+     QApplication,
+@@ -1100,6 +1100,10 @@ class MainWindow(QMainWindow):
+         Windows. Request a stop and wait for the worker to drain
+         before letting the window go.
+         """
++        if not self._image_ctrl.shutdown():
++            event.ignore()
++            QTimer.singleShot(50, self.close)
++            return
+         worker = self._pipeline_ctrl._worker
+         if worker is not None and worker.isRunning():
+             worker.request_stop()
+diff --git a/src/al_dic/gui/controllers/frame_provider.py b/src/al_dic/gui/controllers/frame_provider.py
+index 2e6fdf7..8d767eb 100644
+--- a/src/al_dic/gui/controllers/frame_provider.py
++++ b/src/al_dic/gui/controllers/frame_provider.py
+@@ -12,13 +12,13 @@ worker thread can use it with no shared mutable state and no lock.
+ 
+ from __future__ import annotations
+ 
+-from collections import OrderedDict
+ 
+ import numpy as np
+ from numpy.typing import NDArray
+ 
+ from al_dic.core.data_structures import GridxyROIRange
+-from al_dic.gui.controllers.image_controller import _decode_grayscale_float64
++from al_dic.gui.controllers.image_controller import _decode_grayscale_float64, _read_image_size
++from al_dic.utils.array_cache import ArrayLRU, cache_budget
+ from al_dic.io.image_ops import compute_clamped_roi, normalize_one
+ 
+ _STREAM_CACHE_SIZE = 4  # frames kept resident (ref + current + slack)
+@@ -37,15 +37,19 @@ class StreamingFrameProvider:
+         image_files: list[str],
+         roi: GridxyROIRange,
+         capacity: int = _STREAM_CACHE_SIZE,
++        *,
++        max_cache_bytes: int | None = None,
+     ) -> None:
+         self._paths = list(image_files)
+         self._roi = roi
+         self._capacity = max(1, int(capacity))
+-        self._cache: "OrderedDict[int, NDArray[np.float64]]" = OrderedDict()
++        budget = (cache_budget(256 * 1024**2, fraction=0.04)
++                  if max_cache_bytes is None else max_cache_bytes)
++        self._cache = ArrayLRU(self._capacity, budget)
+         # shape + clamped ROI are derived lazily from frame 0 (matching the
+         # eager ListFrameProvider, which derives them from images[0].shape),
+         # so constructing the provider touches no disk -- the first real
+-        # frame access in the worker triggers the single frame-0 decode.
++        # metadata access in the worker reads only the frame-0 header.
+         self._shape: tuple[int, int] | None = None
+         self._clamped_roi: GridxyROIRange | None = None
+ 
+@@ -53,9 +57,9 @@ class StreamingFrameProvider:
+         if self._shape is not None:
+             return
+         if self._paths:
+-            first = _decode_grayscale_float64(self._paths[0])
+-            self._clamped_roi = compute_clamped_roi(first.shape, self._roi)
+-            self._shape = first.shape  # set LAST: the guard tests _shape
++            shape = _read_image_size(self._paths[0])
++            self._clamped_roi = compute_clamped_roi(shape, self._roi)
++            self._shape = shape  # set LAST: the guard tests _shape
+         else:
+             self._clamped_roi = self._roi
+             self._shape = (0, 0)  # set LAST: the guard tests _shape
+@@ -76,12 +80,9 @@ class StreamingFrameProvider:
+     def get_normalized(self, idx: int) -> NDArray[np.float64]:
+         cached = self._cache.get(idx)
+         if cached is not None:
+-            self._cache.move_to_end(idx)
+             return cached
+         self._ensure_meta()
+         raw = _decode_grayscale_float64(self._paths[idx])
+         normed = normalize_one(raw, self._clamped_roi)
+         self._cache[idx] = normed
+-        if len(self._cache) > self._capacity:
+-            self._cache.popitem(last=False)
+         return normed
+diff --git a/src/al_dic/gui/controllers/image_controller.py b/src/al_dic/gui/controllers/image_controller.py
+index cef5b21..281a484 100644
+--- a/src/al_dic/gui/controllers/image_controller.py
++++ b/src/al_dic/gui/controllers/image_controller.py
+@@ -14,15 +14,16 @@ Sort modes:
+ from __future__ import annotations
+ 
+ import re
+-from collections import OrderedDict
+ from pathlib import Path
+ 
+ import cv2
+ import numpy as np
+ from PIL import Image
+ from numpy.typing import NDArray
++from PySide6.QtCore import QObject, Signal, Slot
+ 
+-from al_dic.gui.app_state import AppState
++from al_dic.gui.app_state import AppState, RunState
++from al_dic.utils.array_cache import ArrayLRU, cache_budget
+ 
+ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
+     {".tif", ".tiff", ".png", ".bmp", ".jpg", ".jpeg", ".jp2", ".webp"}
+@@ -167,18 +168,43 @@ def _decode_grayscale_float64(path: str) -> NDArray[np.float64]:
+     return _normalize_to_float64(gray)
+ 
+ 
++def _decode_rgb(path: str) -> NDArray[np.uint8]:
++    """Stateless, Unicode-safe preview decode shared by GUI and import worker."""
++    raw = _read_image_raw(path)
++    if raw.dtype != np.uint8:
++        raw = _to_display_uint8(raw)
++    if raw.ndim == 2:
++        return cv2.cvtColor(raw, cv2.COLOR_GRAY2RGB)
++    if raw.shape[2] == 4:
++        return cv2.cvtColor(raw, cv2.COLOR_BGRA2RGB)
++    return cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
++
++
+ _RGB_CACHE_SIZE = 8  # max RGB preview frames kept resident (bounded LRU)
+ 
+ 
+-class ImageController:
++class ImageController(QObject):
+     """Loads images from a folder and provides cached reading."""
+ 
+-    def __init__(self, state: AppState) -> None:
++    loading_changed = Signal(bool)
++    scan_progress = Signal(int, int)
++    load_failed = Signal(str)
++
++    def __init__(self, state: AppState, *, cache_bytes: int | None = None) -> None:
++        super().__init__(state)
+         self._state = state
+-        self._cache: dict[int, NDArray[np.float64]] = {}
++        budget = cache_budget(128 * 1024**2) if cache_bytes is None else cache_bytes
++        self._cache = ArrayLRU(4, budget)
+         # Bounded LRU (OrderedDict): scrubbing a long sequence must not
+         # pin every RGB preview frame in RAM; misses re-decode from disk.
+-        self._cache_rgb: "OrderedDict[int, NDArray[np.uint8]]" = OrderedDict()
++        self._cache_rgb = ArrayLRU(_RGB_CACHE_SIZE, budget)
++        self._scan_worker = None
++        self._pending_request = None
++        self._generation = 0
++        self._closing = False
++        self._applying_scan = False
++        self._prepared_preview = None
++        self._requested_folder = ""
+         self._natural_sort: bool = False
+         self._raw_files: list[str] = []  # unsorted file list
+         # Invalidate caches whenever the image file list changes. Each
+@@ -192,9 +218,92 @@ class ImageController:
+         state.images_changed.connect(self._on_images_changed)
+ 
+     def _on_images_changed(self) -> None:
++        if not self._applying_scan:
++            self.cancel_loading()
+         self._cache.clear()
+         self._cache_rgb.clear()
+ 
++    @property
++    def is_loading(self) -> bool:
++        return self._scan_worker is not None or self._pending_request is not None
++
++    def load_folder_async(self, folder: str) -> None:
++        """Import without blocking the event loop; only the latest request wins."""
++        if self._closing:
++            return
++        if self._state.run_state in (RunState.RUNNING, RunState.PAUSED):
++            self.load_failed.emit(self.tr("Stop the current run before importing images."))
++            return
++        self._generation += 1
++        self._requested_folder = folder
++        self._pending_request = (self._generation, folder, self._natural_sort)
++        if self._scan_worker is not None:
++            self._scan_worker.cancel()
++        else:
++            self._start_pending_scan()
++
++    def _start_pending_scan(self) -> None:
++        if self._pending_request is None or self._closing:
++            self.loading_changed.emit(False)
++            return
++        from al_dic.gui.controllers.image_scan import FolderScanWorker
++        request, self._pending_request = self._pending_request, None
++        worker = FolderScanWorker(*request, parent=self)
++        self._scan_worker = worker
++        worker.result_ready.connect(self._on_scan_result)
++        worker.progress.connect(self._on_scan_progress)
++        worker.failed.connect(self._on_scan_failed)
++        worker.finished.connect(self._on_scan_finished)
++        self.loading_changed.emit(True)
++        self.scan_progress.emit(0, 0)
++        worker.start()
++
++    @Slot(int, int, int)
++    def _on_scan_progress(self, generation: int, done: int, total: int) -> None:
++        if generation == self._generation and not self._closing:
++            self.scan_progress.emit(done, total)
++
++    @Slot(int, object)
++    def _on_scan_result(self, generation: int, result) -> None:
++        if generation != self._generation or self._closing:
++            return
++        self._raw_files = list(result.files)
++        self._state.image_folder = result.folder
++        self._prepared_preview = (result.files[0], result.preview) if result.files else None
++        self._applying_scan = True
++        try:
++            self._state.set_image_files(result.files)
++            for message in result.warnings:
++                self._state.log_message.emit(message, "error")
++        finally:
++            self._prepared_preview = None
++            self._applying_scan = False
++
++    @Slot(int, str)
++    def _on_scan_failed(self, generation: int, message: str) -> None:
++        if generation == self._generation and not self._closing:
++            self._state.log_message.emit(message, "error")
++            self.load_failed.emit(message)
++
++    @Slot()
++    def _on_scan_finished(self) -> None:
++        worker, self._scan_worker = self._scan_worker, None
++        if worker is not None:
++            worker.deleteLater()
++        self._start_pending_scan()
++
++    def cancel_loading(self) -> None:
++        self._generation += 1
++        self._pending_request = None
++        if self._scan_worker is not None:
++            self._scan_worker.cancel()
++
++    def shutdown(self) -> bool:
++        """Cooperatively stop import; the window retries close while it drains."""
++        self._closing = True
++        self.cancel_loading()
++        return self._scan_worker is None
++
+     @property
+     def natural_sort(self) -> bool:
+         """Whether natural sort is enabled."""
+@@ -205,11 +314,14 @@ class ImageController:
+         if enabled == self._natural_sort:
+             return
+         self._natural_sort = enabled
+-        if self._raw_files:
+-            self._sort_and_update()
++        if self.is_loading:
++            self.load_folder_async(self._requested_folder)
++        elif self._raw_files:
++            self._sort_and_update(validate=False)
+ 
+     def load_folder(self, folder: str) -> None:
+-        """Scan folder for supported image files, sort, update state.
++        """Synchronously scan for scripts/session helpers; GUI imports use
++        load_folder_async() so disk access cannot block the event loop.
+ 
+         Args:
+             folder: Path to the image folder.
+@@ -243,12 +355,13 @@ class ImageController:
+         the original list and a later sort toggle resurrects the deleted
+         frames -- and rescans every file again.
+         """
++        self.cancel_loading()
+         self._raw_files = list(files)
+         self._cache.clear()
+         self._cache_rgb.clear()
+ 
+-    def _sort_and_update(self) -> None:
+-        """Sort _raw_files with current mode, validate sizes, update state."""
++    def _sort_and_update(self, *, validate: bool = True) -> None:
++        """Sort files, update state, optionally validate during synchronous import."""
+         self._cache.clear()
+         self._cache_rgb.clear()
+ 
+@@ -261,7 +374,7 @@ class ImageController:
+         self._state.set_image_files(files)
+ 
+         # Validate image dimensions (first vs all others)
+-        if len(files) >= 2:
++        if validate and len(files) >= 2:
+             self._validate_dimensions(files)
+ 
+     def _validate_dimensions(self, files: list[str]) -> None:
+@@ -328,30 +441,13 @@ class ImageController:
+             raise IndexError(f"Image index {idx} out of range")
+ 
+         if idx in self._cache_rgb:
+-            self._cache_rgb.move_to_end(idx)  # mark most-recently-used
+             return self._cache_rgb[idx]
+-
+-        raw = _read_image_raw(self._state.image_files[idx])
+-
+-        # Convert non-uint8 to uint8 first (16-bit → 8-bit, etc.)
+-        if raw.dtype != np.uint8:
+-            if raw.ndim == 3:
+-                # Multi-channel: convert each channel
+-                raw = _to_display_uint8(raw)
+-            else:
+-                raw = _to_display_uint8(raw)
+-
+-        # Convert to RGB
+-        if raw.ndim == 2:
+-            rgb = cv2.cvtColor(raw, cv2.COLOR_GRAY2RGB)
+-        elif raw.shape[2] == 4:
+-            rgb = cv2.cvtColor(raw, cv2.COLOR_BGRA2RGB)
++        path = self._state.image_files[idx]
++        if self._prepared_preview is not None and self._prepared_preview[0] == path:
++            rgb = self._prepared_preview[1]
+         else:
+-            rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+-
++            rgb = _decode_rgb(path)
+         self._cache_rgb[idx] = rgb
+-        if len(self._cache_rgb) > _RGB_CACHE_SIZE:
+-            self._cache_rgb.popitem(last=False)  # evict least-recently-used
+         return rgb
+ 
+     def image_dimensions(self, idx: int) -> tuple[int, int]:
+@@ -363,8 +459,9 @@ class ImageController:
+         Returns:
+             (height, width) tuple.
+         """
+-        img = self.read_image(idx)
+-        return img.shape[0], img.shape[1]
++        if idx < 0 or idx >= len(self._state.image_files):
++            raise IndexError(f"Image index {idx} out of range")
++        return _read_image_size(self._state.image_files[idx])
+ 
+     def clear_cache(self) -> None:
+         """Clear the image cache."""
+diff --git a/src/al_dic/gui/controllers/image_scan.py b/src/al_dic/gui/controllers/image_scan.py
+new file mode 100644
+index 0000000..c598a3d
+--- /dev/null
++++ b/src/al_dic/gui/controllers/image_scan.py
+@@ -0,0 +1,106 @@
++"""Cancellable folder import. Workers return data, never mutate GUI state."""
++
++from __future__ import annotations
++
++import os
++import threading
++import time
++from dataclasses import dataclass
++from pathlib import Path
++
++import numpy as np
++from PySide6.QtCore import QThread, Signal
++
++from al_dic.gui.controllers.image_controller import (
++    SUPPORTED_EXTENSIONS, _decode_rgb, _lexicographic_sort_key,
++    _natural_sort_key, _read_image_size,
++)
++
++
++@dataclass
++class FolderScan:
++    folder: Path
++    files: list[str]
++    preview: np.ndarray | None
++    warnings: list[str]
++
++
++class FolderScanWorker(QThread):
++    result_ready = Signal(int, object)
++    progress = Signal(int, int, int)
++    failed = Signal(int, str)
++
++    def __init__(self, generation: int, folder: str, natural: bool, parent=None):
++        super().__init__(parent)
++        self.generation = generation
++        self.folder = folder
++        self.natural = natural
++        self._cancel = threading.Event()
++
++    def cancel(self) -> None:
++        self._cancel.set()
++
++    def run(self) -> None:
++        try:
++            files = []
++            # Resolving a dropped file versus a directory can itself block on
++            # a network filesystem, so keep this probe in the worker too.
++            folder = Path(self.folder)
++            if folder.is_file():
++                folder = folder.parent
++            with os.scandir(folder) as entries:
++                for entry in entries:
++                    if self._cancel.is_set():
++                        return
++                    if (Path(entry.name).suffix.lower() in SUPPORTED_EXTENSIONS
++                            and entry.is_file()):
++                        files.append(entry.path)
++            key = _natural_sort_key if self.natural else _lexicographic_sort_key
++            files.sort(key=lambda p: key(Path(p).name))
++            ref_shape = None
++            mismatches, unreadable = [], []
++            mismatch_count = unreadable_count = 0
++            last_progress = 0.0
++            for i, path in enumerate(files):
++                if self._cancel.is_set():
++                    return
++                try:
++                    shape = _read_image_size(path)
++                    if i == 0:
++                        ref_shape = shape
++                    elif ref_shape is not None and shape != ref_shape:
++                        mismatch_count += 1
++                        if len(mismatches) < 5:
++                            mismatches.append(f"{Path(path).name} ({shape[1]}x{shape[0]})")
++                except Exception as exc:
++                    if i == 0:
++                        raise ValueError(f"Cannot read reference image: {path}: {exc}") from exc
++                    unreadable_count += 1
++                    if len(unreadable) < 5:
++                        unreadable.append(Path(path).name)
++                now = time.monotonic()
++                if now - last_progress >= 0.1 or i + 1 == len(files):
++                    self.progress.emit(self.generation, i + 1, len(files))
++                    last_progress = now
++            if self._cancel.is_set():
++                return
++            # First display decode also belongs off the GUI thread.
++            preview = _decode_rgb(files[0]) if files else None
++            warnings = []
++            if mismatch_count:
++                warnings.append(
++                    f"Image size mismatch! Reference is {ref_shape[1]}x{ref_shape[0]}, "
++                    f"but {mismatch_count} image(s) differ: " + ", ".join(mismatches)
++                )
++            if unreadable_count:
++                warnings.append(
++                    f"Could not read {unreadable_count} image(s): " + ", ".join(unreadable)
++                )
++            if not self._cancel.is_set():
++                self.result_ready.emit(
++                    self.generation,
++                    FolderScan(folder, files, preview, warnings),
++                )
++        except Exception as exc:
++            if not self._cancel.is_set():
++                self.failed.emit(self.generation, f"{type(exc).__name__}: {exc}")
+diff --git a/src/al_dic/gui/controllers/pipeline_controller.py b/src/al_dic/gui/controllers/pipeline_controller.py
+index 3033c05..0cd7d1d 100644
+--- a/src/al_dic/gui/controllers/pipeline_controller.py
++++ b/src/al_dic/gui/controllers/pipeline_controller.py
+@@ -42,20 +42,31 @@ def _build_masks(
+     - Ref frame without own ROI: inherit from frame 0
+     - Non-ref frame without own ROI: all-ones (no mask)
+     """
++    # Snapshot each distinct user mask once. Inherited references share that
++    # immutable snapshot rather than making N full-resolution copies.
++    converted: dict[int, np.ndarray] = {}
++
++    def snapshot(mask: np.ndarray) -> np.ndarray:
++        key = id(mask)
++        if key not in converted:
++            result = mask.astype(np.uint8)
++            result.setflags(write=False)
++            converted[key] = result
++        return converted[key]
++
+     mask0 = per_frame_rois.get(0)
+-    # Store masks as uint8 (0/1): 8x smaller than float64. Every pipeline
+-    # consumer casts via .astype(np.float64) (core/pipeline.py:755/762/1484),
+-    # so values are bit-identical after the cast. Non-ROI frames all share
+-    # ONE read-only all-ones array instead of allocating a full-image mask
+-    # each.
+-    ones_shared = np.ones(img_shape, dtype=np.uint8)
++    inherited = snapshot(mask0) if mask0 is not None else None
++    ones_shared = None
+     masks: list[np.ndarray] = []
+     for i in range(n_frames):
+         if i in per_frame_rois:
+-            masks.append(per_frame_rois[i].astype(np.uint8))
+-        elif i in ref_frame_set and mask0 is not None:
+-            masks.append(mask0.astype(np.uint8))
++            masks.append(snapshot(per_frame_rois[i]))
++        elif i in ref_frame_set and inherited is not None:
++            masks.append(inherited)
+         else:
++            if ones_shared is None:
++                ones_shared = np.ones(img_shape, dtype=np.uint8)
++                ones_shared.setflags(write=False)
+             masks.append(ones_shared)
+     return masks
+ 
+@@ -249,6 +260,13 @@ class PipelineController:
+     def start(self) -> None:
+         """Build config from AppState and launch worker."""
+         state = self._state
++        if getattr(self._image_ctrl, "is_loading", False) is True:
++            state.log_message.emit(
++                QCoreApplication.translate(
++                    "PipelineController", "Wait for image import to finish or cancel it."),
++                "warn",
++            )
++            return
+         if state.run_state == RunState.RUNNING:
+             return
+ 
+diff --git a/src/al_dic/gui/panels/left_sidebar.py b/src/al_dic/gui/panels/left_sidebar.py
+index c9f4908..f19ddbe 100644
+--- a/src/al_dic/gui/panels/left_sidebar.py
++++ b/src/al_dic/gui/panels/left_sidebar.py
+@@ -9,9 +9,6 @@ Fixed width 270px.  Contains:
+ 
+ from __future__ import annotations
+ 
+-import os
+-from pathlib import Path
+-
+ from PySide6.QtCore import Qt
+ from PySide6.QtWidgets import (
+     QCheckBox,
+@@ -19,6 +16,7 @@ from PySide6.QtWidgets import (
+     QFrame,
+     QHBoxLayout,
+     QLabel,
++    QPushButton,
+     QScrollArea,
+     QVBoxLayout,
+     QWidget,
+@@ -123,6 +121,44 @@ class _DropZone(QWidget):
+             "color: {TEXT_MUTED}; font-size: 11px; background: transparent;"
+         )
+         layout.addWidget(text_label)
++        self._status_label = text_label
++        self._load_error = None
++        self._cancel_import = QPushButton(self.tr("Cancel"), self)
++        self._cancel_import.hide()
++        self._cancel_import.clicked.connect(self._cancel_loading)
++        layout.addWidget(self._cancel_import)
++        image_ctrl.loading_changed.connect(self._on_loading_changed)
++        image_ctrl.scan_progress.connect(self._on_scan_progress)
++        image_ctrl.load_failed.connect(self._on_load_failed)
++
++    def _cancel_loading(self) -> None:
++        self._image_ctrl.cancel_loading()
++        self._cancel_import.setEnabled(False)
++        self._status_label.setText(self.tr("Canceling import…"))
++
++    def _on_loading_changed(self, busy: bool) -> None:
++        self._cancel_import.setVisible(busy)
++        self._cancel_import.setEnabled(busy)
++        if busy:
++            self._load_error = None
++            self._status_label.setToolTip("")
++            self._status_label.setText(self.tr("Scanning image folder…"))
++        elif self._load_error:
++            self._status_label.setText(self.tr("Import failed. See log."))
++        else:
++            self._status_label.setText(self.tr("Drop image folder\nor Browse"))
++
++    def _on_scan_progress(self, done: int, total: int) -> None:
++        if total:
++            from al_dic.i18n import tr_args
++            self._status_label.setText(tr_args(
++                self.tr("Checking images: %1 / %2"), done, total,
++            ))
++
++    def _on_load_failed(self, message: str) -> None:
++        self._load_error = message
++        self._status_label.setText(self.tr("Import failed. See log."))
++        self._status_label.setToolTip(message)
+ 
+     def mousePressEvent(self, event) -> None:  # noqa: N802
+         """Open folder dialog on click."""
+@@ -130,7 +166,7 @@ class _DropZone(QWidget):
+             self, self.tr("Select Image Folder"), ""
+         )
+         if folder:
+-            self._image_ctrl.load_folder(folder)
++            self._image_ctrl.load_folder_async(folder)
+ 
+     def dragEnterEvent(self, event) -> None:  # noqa: N802
+         """Accept drag if it contains URLs (folders)."""
+@@ -143,11 +179,8 @@ class _DropZone(QWidget):
+         if not urls:
+             return
+         path = urls[0].toLocalFile()
+-        if os.path.isdir(path):
+-            self._image_ctrl.load_folder(path)
+-        elif os.path.isfile(path):
+-            # If a file was dropped, use its parent directory
+-            self._image_ctrl.load_folder(str(Path(path).parent))
++        if path:
++            self._image_ctrl.load_folder_async(path)
+ 
+ 
+ class LeftSidebar(QWidget):
+diff --git a/src/al_dic/gui/widgets/image_list.py b/src/al_dic/gui/widgets/image_list.py
+index 27cfb63..3673dc5 100644
+--- a/src/al_dic/gui/widgets/image_list.py
++++ b/src/al_dic/gui/widgets/image_list.py
+@@ -3,7 +3,7 @@
+ QTreeWidget with 3 columns:
+ 1. # (Frame number, "00", "01", ...) — fixed 32px
+ 2. Filename — stretch
+-3. ROI — clickable QPushButton (50px): red "Need" / green "Edit" / gray "Add"
++3. ROI — painted action: red "Need" / green "Edit" / gray "Add"
+ 
+ Ref frames get bold + accent-colored filenames for visibility.
+ 
+@@ -17,12 +17,13 @@ from __future__ import annotations
+ 
+ from pathlib import Path
+ 
+-from PySide6.QtCore import QEvent, Qt, Signal
++from PySide6.QtCore import QEvent, QSize, Qt, Signal
+ from PySide6.QtGui import QAction, QColor, QFont
+ from PySide6.QtWidgets import (
+     QHeaderView,
+     QMenu,
+-    QPushButton,
++    QStyledItemDelegate,
++    QStyle,
+     QTreeWidget,
+     QTreeWidgetItem,
+     QVBoxLayout,
+@@ -39,20 +40,55 @@ _COL_FRAME = 0
+ _COL_FILENAME = 1
+ _COL_ROI = 2
+ 
+-# ROI button style templates
+-# ROI button style templates (theme_manager.themed fills the {FIELD}s)
+-_STYLE_ROI_HAS = (
+-    "background: {SUCCESS}; color: #fff; border: none; "
+-    "border-radius: 3px; font-size: 10px; font-weight: bold;"
+-)
+-_STYLE_ROI_NEED = (
+-    "background: {DANGER}; color: #fff; border: none; "
+-    "border-radius: 3px; font-size: 10px; font-weight: bold;"
+-)
+-_STYLE_ROI_ADD = (
+-    "background: {BG_INPUT}; color: {TEXT_MUTED}; "
+-    "border: none; border-radius: 3px; font-size: 10px;"
+-)
++class _RoiDelegate(QStyledItemDelegate):
++    """Paint only visible ROI actions; never allocate a widget per frame."""
++
++    activated = Signal(int)
++
++    def __init__(self, parent=None):
++        super().__init__(parent)
++        self._pressed_row = None
++
++    def paint(self, painter, option, index) -> None:
++        painter.save()
++        rect = option.rect.adjusted(2, 3, -2, -3)
++        status = index.data(Qt.ItemDataRole.UserRole)
++        color = {"has": COLORS.SUCCESS, "need": COLORS.DANGER}.get(
++            status, COLORS.BG_INPUT,
++        )
++        painter.setPen(Qt.PenStyle.NoPen)
++        painter.setBrush(QColor(color))
++        painter.drawRoundedRect(rect, 3, 3)
++        painter.setPen(QColor("#ffffff" if status in ("has", "need")
++                              else COLORS.TEXT_MUTED))
++        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter,
++                         str(index.data(Qt.ItemDataRole.DisplayRole) or ""))
++        if option.state & QStyle.StateFlag.State_HasFocus:
++            painter.setPen(QColor(COLORS.ACCENT))
++            painter.setBrush(Qt.BrushStyle.NoBrush)
++            painter.drawRoundedRect(rect, 3, 3)
++        painter.restore()
++
++    def sizeHint(self, option, index):  # noqa: N802
++        return QSize(44, max(26, option.fontMetrics.height() + 6))
++
++    def editorEvent(self, event, model, option, index):  # noqa: N802
++        if event.type() == QEvent.Type.MouseButtonRelease:
++            pressed, self._pressed_row = self._pressed_row, None
++            if (event.button() == Qt.MouseButton.LeftButton
++                    and pressed == index.row()):
++                self.activated.emit(index.row())
++                return True
++        if event.type() == QEvent.Type.MouseButtonPress:
++            if event.button() == Qt.MouseButton.LeftButton:
++                self._pressed_row = index.row()
++                return True
++        if event.type() == QEvent.Type.KeyPress and event.key() in (
++            Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space,
++        ):
++            self.activated.emit(index.row())
++            return True
++        return False
+ 
+ 
+ class ImageList(QWidget):
+@@ -78,9 +114,6 @@ class ImageList(QWidget):
+         self._state = state
+         self._image_ctrl = image_ctrl
+ 
+-        # Lookup maps for per-row widgets
+-        self._roi_buttons: dict[int, QPushButton] = {}
+-
+         # Suppress _sync_selection when frame change originates from this widget
+         self._suppress_sync = False
+ 
+@@ -104,18 +137,17 @@ class ImageList(QWidget):
+         connect_theme(self._on_theme_changed)
+         self._tree.setRootIsDecorated(False)
+         self._tree.setIndentation(0)
+-        # Disable Qt's built-in autoScroll: when an item-widget QPushButton
+-        # (the ROI Add/Edit/Need button) receives a hover/focus event, Qt
+-        # otherwise calls ensureVisible() on the owning row, which scrolls
+-        # the bottommost visible row fully into view -- producing the
+-        # "hovering Add scrolls list to last frame" bug.  We re-add an
+-        # explicit scrollToItem in _sync_selection so keyboard navigation
+-        # and external frame changes still keep the current row visible.
++        self._tree.setUniformRowHeights(True)
++        self._roi_delegate = _RoiDelegate(self._tree)
++        self._roi_delegate.activated.connect(self.roi_edit_requested)
++        self._tree.setItemDelegateForColumn(_COL_ROI, self._roi_delegate)
++        # Navigation scrolls explicitly; hovering an ROI action must not.
+         self._tree.setAutoScroll(False)
+ 
+         # Column sizing
+         header = self._tree.header()
+         header.setMinimumSectionSize(10)
++        header.setStretchLastSection(False)
+         header.resizeSection(_COL_FRAME, 32)
+         # Region column only holds short button labels (Add / Edit / Need),
+         # so give more horizontal space to the Filename (stretch) column.
+@@ -164,65 +196,31 @@ class ImageList(QWidget):
+ 
+         # Tree selection -> state update (keyboard: eventFilter, mouse: itemClicked)
+         self._tree.installEventFilter(self)
++        self._tree.viewport().setMouseTracking(True)
++        self._tree.viewport().installEventFilter(self)
+         self._tree.itemClicked.connect(self._on_item_clicked)
+ 
+     def _rebuild_list(self) -> None:
+-        """Rebuild the tree from current state."""
+-        self._tree.blockSignals(True)
+-        self._tree.clear()
+-        self._roi_buttons.clear()
+-
+-        for i, filepath in enumerate(self._state.image_files):
+-            filename = Path(filepath).name
+-            item = QTreeWidgetItem()
+-            item.setText(_COL_FRAME, f"{i:02d}")
+-            item.setTextAlignment(
+-                _COL_FRAME, Qt.AlignmentFlag.AlignCenter
+-            )
+-            item.setText(_COL_FILENAME, filename)
+-            item.setData(
+-                _COL_FRAME, Qt.ItemDataRole.UserRole, i
+-            )
+-            # Disable default editing
+-            item.setFlags(
+-                item.flags() & ~Qt.ItemFlag.ItemIsEditable
+-            )
+-            self._tree.addTopLevelItem(item)
+-
+-            # ROI button
+-            roi_btn = QPushButton(self.tr("Add"))
+-            roi_btn.setFixedHeight(20)
+-            roi_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+-            # NoFocus prevents the button from stealing focus on hover/click,
+-            # which would otherwise let Qt's view scroll-on-focus behaviour
+-            # drag the bottommost row into view (in addition to the
+-            # tree-level autoScroll guard set in __init__).
+-            roi_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+-            themed(roi_btn, _STYLE_ROI_ADD)
+-            roi_btn.clicked.connect(
+-                self._make_roi_click_handler(i)
+-            )
+-            self._tree.setItemWidget(item, _COL_ROI, roi_btn)
+-            self._roi_buttons[i] = roi_btn
+-
+-        # Select frame 0 if images are loaded
+-        if self._state.image_files:
+-            first_item = self._tree.topLevelItem(0)
+-            if first_item is not None:
+-                self._tree.setCurrentItem(first_item)
+-
+-        self._tree.blockSignals(False)
+-
+-        # Update ROI indicators after rebuild
+-        self._update_roi_indicators()
+-
+-    def _make_roi_click_handler(self, frame: int):
+-        """Create a closure for the ROI button click of a specific frame."""
+-
+-        def handler() -> None:
+-            self.roi_edit_requested.emit(frame)
+-
+-        return handler
++        """Insert lightweight rows in one batch; ROI actions are painted."""
++        blocked = self._tree.blockSignals(True)
++        self._tree.setUpdatesEnabled(False)
++        try:
++            self._tree.clear()
++            items = []
++            for i, filepath in enumerate(self._state.image_files):
++                item = QTreeWidgetItem([f"{i:02d}", Path(filepath).name, ""])
++                item.setTextAlignment(_COL_FRAME, Qt.AlignmentFlag.AlignCenter)
++                item.setData(_COL_FRAME, Qt.ItemDataRole.UserRole, i)
++                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
++                items.append(item)
++            self._tree.addTopLevelItems(items)
++            self._update_roi_indicators()
++            if items:
++                idx = min(self._state.current_frame, len(items) - 1)
++                self._tree.setCurrentItem(items[idx])
++        finally:
++            self._tree.blockSignals(blocked)
++            self._tree.setUpdatesEnabled(True)
+ 
+     def _on_theme_changed(self, _name: str) -> None:
+         """Reference-frame rows are tinted with the accent colour: tint again."""
+@@ -238,22 +236,20 @@ class ImageList(QWidget):
+ 
+         for i in range(n):
+             item = self._tree.topLevelItem(i)
+-            btn = self._roi_buttons.get(i)
+-            if item is None or btn is None:
++            if item is None:
+                 continue
+ 
+             has_roi = i in self._state.per_frame_rois
+             is_ref = i in ref_frames
+ 
+             if has_roi:
+-                btn.setText(self.tr("Edit"))
+-                themed(btn, _STYLE_ROI_HAS)
++                label, status = self.tr("Edit"), "has"
+             elif is_ref:
+-                btn.setText(self.tr("Need"))
+-                themed(btn, _STYLE_ROI_NEED)
++                label, status = self.tr("Need"), "need"
+             else:
+-                btn.setText(self.tr("Add"))
+-                themed(btn, _STYLE_ROI_ADD)
++                label, status = self.tr("Add"), "add"
++            item.setText(_COL_ROI, label)
++            item.setData(_COL_ROI, Qt.ItemDataRole.UserRole, status)
+ 
+             # Ref-frame highlighting: subtle row background + bold accent filename
+             n_cols = 3  # frame, filename, ROI
+@@ -322,6 +318,11 @@ class ImageList(QWidget):
+ 
+     def eventFilter(self, obj, event):
+         """Handle keyboard navigation in the tree — switch frame on arrow keys."""
++        if obj is self._tree.viewport() and event.type() == QEvent.Type.MouseMove:
++            index = self._tree.indexAt(event.position().toPoint())
++            cursor = (Qt.CursorShape.PointingHandCursor if index.column() == _COL_ROI
++                      else Qt.CursorShape.ArrowCursor)
++            self._tree.viewport().setCursor(cursor)
+         if obj is self._tree and event.type() == QEvent.Type.KeyRelease:
+             if event.key() in (
+                 Qt.Key.Key_Up, Qt.Key.Key_Down,
+@@ -426,6 +427,7 @@ class ImageList(QWidget):
+                 del files[row]
+ 
+         if not files:
++            self._image_ctrl.set_files([])
+             self._state.per_frame_rois.clear()
+             self._state.set_image_files([])
+             return
+diff --git a/src/al_dic/utils/array_cache.py b/src/al_dic/utils/array_cache.py
+new file mode 100644
+index 0000000..2e0d069
+--- /dev/null
++++ b/src/al_dic/utils/array_cache.py
+@@ -0,0 +1,76 @@
++"""Byte- and item-bounded image caches, independent of Qt and the platform."""
++
++from __future__ import annotations
++
++from collections import OrderedDict
++from collections.abc import Iterator, MutableMapping
++
++import numpy as np
++
++
++def cache_budget(ceiling: int, fraction: float = 0.02) -> int:
++    """Use a small fraction of available RAM, or a conservative fallback.
++
++    psutil is optional. Unknown memory availability never means unlimited
++    caching. The budget bounds retained arrays, not the solver's working set.
++    """
++    fallback = min(ceiling, 64 * 1024**2)
++    try:
++        import psutil
++
++        available = int(psutil.virtual_memory().available)
++        if available > 0:
++            return max(0, min(ceiling, int(available * fraction)))
++    except (ImportError, OSError, AttributeError, ValueError):
++        pass
++    return fallback
++
++
++class ArrayLRU(MutableMapping):
++    """Retain at most max_items and max_bytes of array payloads.
++
++    An oversized frame is served by its caller without being retained here.
++    Composition avoids OrderedDict subclass eviction differences across
++    Python versions. Each instance is confined to its owning thread.
++    """
++
++    def __init__(self, max_items: int, max_bytes: int) -> None:
++        self.max_items = max(0, int(max_items))
++        self.max_bytes = max(0, int(max_bytes))
++        self._data: OrderedDict[int, np.ndarray] = OrderedDict()
++        self.nbytes = 0
++
++    def __getitem__(self, key: int) -> np.ndarray:
++        value = self._data[key]
++        self._data.move_to_end(key)
++        return value
++
++    def __setitem__(self, key: int, value: np.ndarray) -> None:
++        if key in self._data:
++            del self[key]
++        size = value.nbytes
++        if not self.max_items or size > self.max_bytes:
++            return
++        while self._data and (
++            len(self._data) >= self.max_items
++            or self.nbytes + size > self.max_bytes
++        ):
++            del self[next(iter(self._data))]
++        self._data[key] = value
++        self.nbytes += size
++
++    def __delitem__(self, key: int) -> None:
++        self.nbytes -= self._data.pop(key).nbytes
++
++    def __iter__(self) -> Iterator:
++        return iter(self._data)
++
++    def __len__(self) -> int:
++        return len(self._data)
++
++    def __contains__(self, key: object) -> bool:
++        return key in self._data
++
++    def clear(self) -> None:
++        self._data.clear()
++        self.nbytes = 0
+diff --git a/tests/test_gui_image_controller.py b/tests/test_gui_image_controller.py
+index add5511..812d625 100644
+--- a/tests/test_gui_image_controller.py
++++ b/tests/test_gui_image_controller.py
+@@ -96,7 +96,7 @@ def _make_seq(folder: Path, fills: list[int]) -> Path:
+ 
+ class TestRgbCacheLRU:
+     """Change A: bounded LRU on the RGB preview cache (_cache_rgb). The
+-    float64 COMPUTE cache (_cache) must stay an unbounded plain dict."""
++    float64 cache is now bounded too; eviction must preserve decoded values."""
+ 
+     def test_rgb_cache_is_bounded(self, qapp, tmp_path):
+         state = AppState.instance()
+@@ -150,18 +150,20 @@ class TestRgbCacheLRU:
+         b0 = ctrl.read_image_rgb(0)
+         assert int(b0[0, 0, 0]) == 200       # B's frame 0, not A's stale 10
+ 
+-    def test_float64_compute_cache_untouched(self, qapp, tmp_path):
+-        """A must NOT bound or convert the float64 compute cache."""
++    def test_float64_cache_bounded_and_exact(self, qapp, tmp_path):
++        """Large sequences must not accumulate all float64 previews in RAM."""
+         state = AppState.instance()
+         state.reset()
+         ctrl = ImageController(state)
+         n = _RGB_CACHE_SIZE + 5
+         ctrl.load_folder(str(_make_seq(tmp_path / "seq", list(range(n)))))
++        first = ctrl.read_image(0).copy()
+         for i in range(n):
+-            ctrl.read_image(i)               # float64 compute path
+-        assert type(ctrl._cache) is dict     # still a plain dict
+-        assert len(ctrl._cache) == n         # unbounded: all frames resident
+-        assert len(ctrl._cache) > _RGB_CACHE_SIZE
++            ctrl.read_image(i)
++        assert len(ctrl._cache) <= 4
++        assert ctrl._cache.nbytes <= ctrl._cache.max_bytes
++        assert 0 not in ctrl._cache
++        np.testing.assert_array_equal(first, ctrl.read_image(0))
+ 
+     def test_second_controller_also_bounded(self, qapp, tmp_path):
+         """StrainWindow owns its own ImageController; the class-level LRU
+diff --git a/tests/test_large_sequence_support.py b/tests/test_large_sequence_support.py
+new file mode 100644
+index 0000000..c14ac98
+--- /dev/null
++++ b/tests/test_large_sequence_support.py
+@@ -0,0 +1,440 @@
++"""Behavioral regressions for imports and bounded memory.
++
++Run with pytest or python -m unittest tests.test_large_sequence_support.
++The tests need no particular image resolution, machine RAM, or real dataset.
++"""
++
++from __future__ import annotations
++
++import tempfile
++import threading
++import time
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import numpy as np
++from PIL import Image
++from PySide6.QtCore import QEvent, QPointF, QThread, QTimer, Qt
++from PySide6.QtGui import QMouseEvent
++from PySide6.QtWidgets import QApplication, QPushButton, QStyleOptionViewItem
++
++from al_dic.core.data_structures import DICPara, GridxyROIRange
++from al_dic.gui.app_state import AppState, RunState
++from al_dic.gui.controllers.frame_provider import StreamingFrameProvider
++from al_dic.gui.controllers.image_controller import ImageController, _decode_grayscale_float64
++from al_dic.gui.controllers.pipeline_controller import PipelineController, _build_masks
++from al_dic.gui.widgets.image_list import ImageList
++from al_dic.io.image_ops import ListFrameProvider
++from al_dic.utils.array_cache import ArrayLRU, cache_budget
++
++
++def pump_until(predicate, timeout=8):
++    deadline = time.monotonic() + timeout
++    while not predicate():
++        QApplication.processEvents()
++        if time.monotonic() > deadline:
++            raise AssertionError("Asynchronous operation did not finish")
++        time.sleep(0.002)
++    QApplication.processEvents()
++
++
++def make_frames(folder, count=3, shape=(32, 48), dtype=np.uint8):
++    folder.mkdir(parents=True, exist_ok=True)
++    paths = []
++    base = (np.random.default_rng(5).random(shape) * 200).astype(dtype)
++    for i in range(count):
++        path = folder / f"image_{i:05d}.tif"
++        Image.fromarray(base + i).save(path)
++        paths.append(str(path))
++    return paths
++
++
++class TestArrayLRU(unittest.TestCase):
++    def test_byte_limit_and_recency(self):
++        c = ArrayLRU(100, 32)
++        for i in (0, 1):
++            c[i] = np.zeros(16, np.uint8)
++        c[0]
++        c[2] = np.ones(16, np.uint8)
++        self.assertEqual(list(c), [0, 2])
++        self.assertEqual(c.nbytes, 32)
++
++    def test_oversized_and_disabled_cache(self):
++        for budget in (0, 8):
++            c = ArrayLRU(4, budget)
++            c[0] = np.zeros(16, np.uint8)
++            self.assertEqual(len(c), 0)
++            self.assertEqual(c.nbytes, 0)
++
++    def test_replace_clear_and_item_limit(self):
++        c = ArrayLRU(2, 100)
++        for i in range(100):
++            c[i] = np.zeros(4, np.uint8)
++        self.assertEqual(len(c), 2)
++        c[99] = np.zeros(8, np.uint8)
++        self.assertEqual(c.nbytes, 12)
++        c.clear()
++        self.assertEqual(c.nbytes, 0)
++
++    def test_budget_uses_available_ram_and_has_fallback(self):
++        fake = SimpleNamespace(virtual_memory=lambda: SimpleNamespace(available=1000))
++        with patch.dict("sys.modules", {"psutil": fake}):
++            self.assertEqual(cache_budget(200, 0.05), 50)
++        with patch.dict("sys.modules", {"psutil": None}):
++            self.assertEqual(cache_budget(1024**3), 64 * 1024**2)
++
++
++class TestSharedMasks(unittest.TestCase):
++    def test_ten_thousand_references_have_two_buffers(self):
++        roi = np.ones((8, 11), bool)
++        roi[0] = False
++        masks = _build_masks({0: roi}, 10000, roi.shape, set(range(9999)))
++        self.assertEqual(len({id(m) for m in masks}), 2)
++        self.assertIs(masks[0], masks[9998])
++        self.assertFalse(masks[0].flags.writeable)
++        self.assertFalse(masks[-1].flags.writeable)
++        np.testing.assert_array_equal(masks[0], roi)
++        roi[:] = False
++        self.assertTrue(masks[0][1, 0])  # worker snapshot is isolated
++
++    def test_custom_masks_preserve_values_and_aliases(self):
++        a = np.eye(8, dtype=bool)
++        b = np.ones((8, 8), bool)
++        masks = _build_masks({0: a, 2: b, 3: b}, 5, a.shape, {0, 1})
++        self.assertIs(masks[0], masks[1])
++        self.assertIs(masks[2], masks[3])
++        np.testing.assert_array_equal(masks[2], b)
++        self.assertEqual(masks[-1].sum(), 64)
++
++
++class QtCase(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.app = QApplication.instance() or QApplication([])
++
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.folder = Path(self.temp.name)
++        self.state = AppState()
++        self.ctrl = ImageController(self.state)
++        self.widgets = []
++
++    def tearDown(self):
++        self.ctrl.cancel_loading()
++        pump_until(lambda: not self.ctrl.is_loading)
++        for widget in self.widgets:
++            widget.close()
++            widget.deleteLater()
++        self.state.deleteLater()
++        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
++        self.app.processEvents()
++        self.temp.cleanup()
++
++
++class TestImageListScale(QtCase):
++    def test_ten_thousand_rows_without_button_widgets(self):
++        view = ImageList(self.state, self.ctrl)
++        self.widgets.append(view)
++        self.state.set_image_files([f"frame_{i}.tif" for i in range(10000)])
++        self.assertEqual(view._tree.topLevelItemCount(), 10000)
++        self.assertEqual(view.findChildren(QPushButton), [])
++        self.assertIsNone(view._tree.itemWidget(view._tree.topLevelItem(0), 2))
++
++    def test_roi_status_and_click_route_to_correct_frame(self):
++        view = ImageList(self.state, self.ctrl)
++        self.widgets.append(view)
++        self.state.set_image_files(["a.tif", "b.tif", "c.tif"])
++        self.assertEqual(view._tree.topLevelItem(0).text(2), "Need")
++        self.assertEqual(view._tree.topLevelItem(1).text(2), "Add")
++        self.state.per_frame_rois[1] = np.ones((2, 2), bool)
++        self.state.roi_changed.emit()
++        self.assertEqual(view._tree.topLevelItem(1).text(2), "Edit")
++        seen = []
++        view.roi_edit_requested.connect(seen.append)
++        press = QMouseEvent(
++            QEvent.Type.MouseButtonPress, QPointF(5, 5), QPointF(5, 5),
++            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
++            Qt.KeyboardModifier.NoModifier,
++        )
++        event = QMouseEvent(
++            QEvent.Type.MouseButtonRelease, QPointF(5, 5), QPointF(5, 5),
++            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
++            Qt.KeyboardModifier.NoModifier,
++        )
++        index = view._tree.model().index(1, 2)
++        view._roi_delegate.editorEvent(event, view._tree.model(), QStyleOptionViewItem(), index)
++        self.assertEqual(seen, [])  # a release without a press is not a click
++        view._roi_delegate.editorEvent(press, view._tree.model(), QStyleOptionViewItem(), index)
++        view._roi_delegate.editorEvent(event, view._tree.model(), QStyleOptionViewItem(), index)
++        self.assertEqual(seen, [1])
++
++    def test_selection_and_delete_all_do_not_resurrect_frames(self):
++        view = ImageList(self.state, self.ctrl)
++        self.widgets.append(view)
++        make_frames(self.folder)
++        self.ctrl.load_folder(str(self.folder))
++        self.state.set_current_frame(2)
++        self.assertEqual(view._tree.currentItem().text(0), "02")
++        view._tree.selectAll()
++        view._delete_selected()
++        self.ctrl.set_natural_sort(True)
++        self.assertEqual(self.state.image_files, [])
++
++
++class TestAsyncImport(QtCase):
++    def test_dropped_file_imports_parent_folder(self):
++        paths = make_frames(self.folder)
++        self.ctrl.load_folder_async(paths[1])
++        pump_until(lambda: not self.ctrl.is_loading)
++        self.assertEqual(self.state.image_files, paths)
++        self.assertEqual(self.state.image_folder, self.folder)
++
++    def test_first_preview_is_decoded_in_worker_even_without_cache(self):
++        from al_dic.gui.controllers import image_scan
++        paths = make_frames(self.folder)
++        self.ctrl._cache_rgb.max_bytes = 0
++        threads, images = [], []
++        real_decode = image_scan._decode_rgb
++
++        def decode(path):
++            threads.append(QThread.currentThread())
++            return real_decode(path)
++
++        self.state.images_changed.connect(lambda: images.append(self.ctrl.read_image_rgb(0)))
++        with patch.object(image_scan, "_decode_rgb", side_effect=decode), patch(
++            "al_dic.gui.controllers.image_controller._decode_rgb",
++            side_effect=AssertionError("preview decoded on GUI thread"),
++        ):
++            self.ctrl.load_folder_async(str(self.folder))
++            pump_until(lambda: not self.ctrl.is_loading)
++        self.assertEqual(self.state.image_files, paths)
++        self.assertEqual(len(images), 1)
++        self.assertEqual(len(threads), 1)
++        self.assertNotEqual(threads[0], self.app.thread())
++
++    def test_gui_heartbeat_continues_during_slow_scan(self):
++        from al_dic.gui.controllers import image_scan
++        make_frames(self.folder)
++        entered, release = threading.Event(), threading.Event()
++        original = image_scan._read_image_size
++        ticks = []
++        timer = QTimer()
++        timer.setInterval(5)
++        timer.timeout.connect(lambda: ticks.append(1))
++
++        def slow(path):
++            entered.set()
++            release.wait(5)
++            return original(path)
++
++        try:
++            with patch.object(image_scan, "_read_image_size", side_effect=slow):
++                timer.start()
++                self.ctrl.load_folder_async(str(self.folder))
++                pump_until(entered.is_set)
++                pump_until(lambda: len(ticks) >= 5)
++                self.assertTrue(self.ctrl.is_loading)
++                release.set()
++                pump_until(lambda: not self.ctrl.is_loading)
++        finally:
++            release.set()
++            timer.stop()
++
++    def test_latest_folder_wins_and_worker_count_is_bounded(self):
++        from al_dic.gui.controllers import image_scan
++        a, b = self.folder / "a", self.folder / "b"
++        make_frames(a)
++        expected = make_frames(b, 2)
++        entered, release = threading.Event(), threading.Event()
++        original = image_scan._read_image_size
++
++        def slow(path):
++            if str(a) in path:
++                entered.set()
++                release.wait(5)
++            return original(path)
++
++        try:
++            with patch.object(image_scan, "_read_image_size", side_effect=slow):
++                self.ctrl.load_folder_async(str(a))
++                pump_until(entered.is_set)
++                old = self.ctrl._scan_worker
++                for _ in range(20):
++                    self.ctrl.load_folder_async(str(b))
++                self.assertIs(self.ctrl._scan_worker, old)
++                release.set()
++                pump_until(lambda: not self.ctrl.is_loading)
++            self.assertEqual(self.state.image_files, expected)
++        finally:
++            release.set()
++
++    def test_cancel_and_shutdown_preserve_existing_sequence(self):
++        from al_dic.gui.controllers import image_scan
++        make_frames(self.folder)
++        self.state.set_image_files(["old.tif"])
++        entered, release = threading.Event(), threading.Event()
++        original = image_scan._read_image_size
++
++        def slow(path):
++            entered.set()
++            release.wait(5)
++            return original(path)
++
++        try:
++            with patch.object(image_scan, "_read_image_size", side_effect=slow):
++                self.ctrl.load_folder_async(str(self.folder))
++                pump_until(entered.is_set)
++                self.assertFalse(self.ctrl.shutdown())
++                release.set()
++                pump_until(lambda: not self.ctrl.is_loading)
++            self.assertTrue(self.ctrl.shutdown())
++            self.assertEqual(self.state.image_files, ["old.tif"])
++        finally:
++            release.set()
++
++    def test_failure_preserves_existing_sequence(self):
++        self.state.set_image_files(["old.tif"])
++        errors = []
++        self.ctrl.load_failed.connect(errors.append)
++        self.ctrl.load_folder_async(str(self.folder / "missing"))
++        pump_until(lambda: not self.ctrl.is_loading)
++        self.assertEqual(len(errors), 1)
++        self.assertEqual(self.state.image_files, ["old.tif"])
++
++    def test_queued_result_is_discarded_after_cancel(self):
++        make_frames(self.folder)
++        self.state.set_image_files(["old.tif"])
++        self.ctrl.load_folder_async(str(self.folder))
++        self.assertTrue(self.ctrl._scan_worker.wait(5000))
++        # The worker is done, but its result has not reached the GUI yet.
++        self.ctrl.cancel_loading()
++        pump_until(lambda: not self.ctrl.is_loading)
++        self.assertEqual(self.state.image_files, ["old.tif"])
++
++    def test_unicode_folder_mismatches_and_unreadable_files(self):
++        folder = self.folder / "试样 α"
++        make_frames(folder, 2)
++        Image.new("L", (19, 17)).save(folder / "image_00002.tif")
++        (folder / "image_00003.tif").write_bytes(b"invalid image")
++        messages, gui_threads = [], []
++        self.state.log_message.connect(lambda text, level: messages.append(text))
++        self.state.images_changed.connect(lambda: gui_threads.append(QThread.currentThread()))
++        self.ctrl.load_folder_async(str(folder))
++        pump_until(lambda: not self.ctrl.is_loading)
++        self.assertEqual(len(self.state.image_files), 4)
++        self.assertTrue(any("size mismatch" in m for m in messages))
++        self.assertTrue(any("Could not read 1" in m for m in messages))
++        self.assertEqual(gui_threads, [self.app.thread()])
++
++    def test_empty_folder_clears_sequence(self):
++        self.state.set_image_files(["old.tif"])
++        self.ctrl.load_folder_async(str(self.folder))
++        pump_until(lambda: not self.ctrl.is_loading)
++        self.assertEqual(self.state.image_files, [])
++
++    def test_import_is_rejected_while_solver_runs(self):
++        self.state.run_state = RunState.RUNNING
++        errors = []
++        self.ctrl.load_failed.connect(errors.append)
++        self.ctrl.load_folder_async(str(self.folder))
++        self.assertFalse(self.ctrl.is_loading)
++        self.assertEqual(len(errors), 1)
++
++    def test_main_window_close_waits_without_blocking_gui(self):
++        from al_dic.gui.app import MainWindow
++        from al_dic.gui.controllers import image_scan
++        make_frames(self.folder)
++        entered, release = threading.Event(), threading.Event()
++        original = image_scan._read_image_size
++
++        def slow(path):
++            entered.set()
++            release.wait(5)
++            return original(path)
++
++        with patch.object(AppState, "instance", return_value=self.state):
++            win = MainWindow()
++        self.widgets.append(win)
++        win.show()
++        try:
++            with patch.object(image_scan, "_read_image_size", side_effect=slow):
++                win._image_ctrl.load_folder_async(str(self.folder))
++                pump_until(entered.is_set)
++                win.close()
++                self.assertTrue(win.isVisible())
++                release.set()
++                pump_until(lambda: not win.isVisible())
++            self.assertFalse(win._image_ctrl.is_loading)
++        finally:
++            release.set()
++            win._image_ctrl.cancel_loading()
++            pump_until(lambda: not win._image_ctrl.is_loading)
++
++    def test_sort_toggle_does_not_scan_again(self):
++        make_frames(self.folder)
++        self.ctrl.load_folder(str(self.folder))
++        with patch("al_dic.gui.controllers.image_controller._read_image_size",
++                   side_effect=AssertionError("unexpected rescan")):
++            self.ctrl.set_natural_sort(True)
++        self.assertEqual(len(self.state.image_files), 3)
++
++    def test_run_cannot_start_during_import(self):
++        proxy = SimpleNamespace(is_loading=True)
++        pipeline = PipelineController(self.state, proxy)
++        pipeline.start()
++        self.assertIsNone(pipeline._worker)
++        self.assertEqual(self.state.run_state, RunState.IDLE)
++
++
++class TestFrameCacheParity(QtCase):
++    def test_grayscale_cache_is_bounded_and_reload_exact(self):
++        paths = make_frames(self.folder, 10)
++        self.ctrl.load_folder(str(self.folder))
++        first = self.ctrl.read_image(0).copy()
++        for i in range(len(paths)):
++            self.ctrl.read_image(i)
++        self.assertLessEqual(len(self.ctrl._cache), 4)
++        self.assertNotIn(0, self.ctrl._cache)
++        np.testing.assert_array_equal(first, self.ctrl.read_image(0))
++
++    def test_stream_matches_eager_for_depths_and_tiny_budgets(self):
++        for dtype in (np.uint8, np.uint16):
++            paths = make_frames(self.folder / str(dtype), dtype=dtype)
++            roi = GridxyROIRange(gridx=(3, 40), gridy=(2, 28))
++            eager = ListFrameProvider([_decode_grayscale_float64(p) for p in paths], roi)
++            for budget in (0, 64, 32 * 48 * 8 * 2):
++                stream = StreamingFrameProvider(paths, roi, max_cache_bytes=budget)
++                for i in (0, 2, 1, 0, 2):
++                    np.testing.assert_array_equal(stream.get_normalized(i), eager.get_normalized(i))
++                    self.assertLessEqual(stream._cache.nbytes, budget)
++
++    def test_solver_results_match_eager_with_shared_readonly_masks(self):
++        from al_dic.core.pipeline import run_aldic
++        paths = make_frames(self.folder, count=3, shape=(64, 64))
++        roi = GridxyROIRange(gridx=(10, 54), gridy=(10, 54))
++        para = DICPara(
++            winstepsize=16, winsize=20, winsize_min=8, tol=1e-2,
++            mu=1e-3, admm_max_iter=2, admm_tol=1e-2, gauss_pt_order=2,
++            alpha=0.0, use_global_step=False, disp_smoothness=0.0,
++            strain_smoothness=0.0, smoothness=0.0, method_to_compute_strain=3,
++            strain_type=0, gridxy_roi_range=roi, img_size=(64, 64),
++            icgn_max_iter=50, reference_mode="incremental",
++        )
++        mask = np.ones((64, 64), bool)
++        a = run_aldic(para, [_decode_grayscale_float64(p) for p in paths],
++                      [mask.astype(float) for _ in paths], compute_strain=False)
++        b = run_aldic(para, StreamingFrameProvider(paths, roi, max_cache_bytes=0),
++                      _build_masks({0: mask}, len(paths), mask.shape, {0, 1}),
++                      compute_strain=False)
++        self.assertEqual(len(a.result_disp), len(b.result_disp))
++        for x, y in zip(a.result_disp, b.result_disp):
++            np.testing.assert_array_equal(x.U, y.U)
++            np.testing.assert_array_equal(x.U_accum, y.U_accum)
++        for x, y in zip(a.result_def_grad, b.result_def_grad):
++            np.testing.assert_array_equal(x.F, y.F)
++
++
++if __name__ == "__main__":
++    unittest.main()
